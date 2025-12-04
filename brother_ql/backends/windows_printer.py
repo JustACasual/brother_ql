@@ -103,8 +103,11 @@ class BrotherQLBackendWindows(BrotherQLBackendGeneric):
         if self.hprinter is not None:
             return
         
+        # Load winspool.drv explicitly
+        winspool = ctypes.WinDLL('winspool.drv')
+        
         self.hprinter = wintypes.HANDLE()
-        result = ctypes.windll.winspool.OpenPrinterW(
+        result = winspool.OpenPrinterW(
             ctypes.c_wchar_p(self.printer_name),
             ctypes.byref(self.hprinter),
             None
@@ -116,7 +119,8 @@ class BrotherQLBackendWindows(BrotherQLBackendGeneric):
     def _close_printer(self):
         """Close the printer handle"""
         if self.hprinter is not None:
-            ctypes.windll.winspool.ClosePrinter(self.hprinter)
+            winspool = ctypes.WinDLL('winspool.drv')
+            winspool.ClosePrinter(self.hprinter)
             self.hprinter = None
     
     def _write(self, data):
@@ -124,22 +128,58 @@ class BrotherQLBackendWindows(BrotherQLBackendGeneric):
         try:
             self._open_printer()
             
+            # Load winspool.drv
+            winspool = ctypes.WinDLL('winspool.drv')
+            
             # WritePrinter requires the data as bytes
             if isinstance(data, str):
                 data = data.encode('latin-1')
             
-            written = wintypes.DWORD()
-            result = ctypes.windll.winspool.WritePrinter(
-                self.hprinter,
-                data,
-                len(data),
-                ctypes.byref(written)
-            )
+            # Define DOC_INFO_1 structure for StartDocPrinter
+            class DOC_INFO_1(ctypes.Structure):
+                _fields_ = [
+                    ("pDocName", wintypes.LPWSTR),
+                    ("pOutputFile", wintypes.LPWSTR),
+                    ("pDatatype", wintypes.LPWSTR),
+                ]
             
-            if not result:
-                raise IOError(f'WritePrinter failed. Bytes written: {written.value} of {len(data)}')
+            # Start a print job
+            doc_info = DOC_INFO_1()
+            doc_info.pDocName = "Brother QL Label"
+            doc_info.pOutputFile = None
+            doc_info.pDatatype = "RAW"  # RAW mode - send data directly to printer
             
-            logger.debug(f'Wrote {written.value} bytes to printer')
+            job_id = winspool.StartDocPrinterW(self.hprinter, 1, ctypes.byref(doc_info))
+            if not job_id:
+                raise IOError('StartDocPrinter failed')
+            
+            try:
+                # Start a page
+                if not winspool.StartPagePrinter(self.hprinter):
+                    raise IOError('StartPagePrinter failed')
+                
+                # Write the data
+                written = wintypes.DWORD()
+                result = winspool.WritePrinter(
+                    self.hprinter,
+                    data,
+                    len(data),
+                    ctypes.byref(written)
+                )
+                
+                if not result:
+                    raise IOError(f'WritePrinter failed. Bytes written: {written.value} of {len(data)}')
+                
+                logger.debug(f'Wrote {written.value} bytes to printer')
+                
+                # End the page
+                if not winspool.EndPagePrinter(self.hprinter):
+                    logger.warning('EndPagePrinter failed')
+                
+            finally:
+                # End the document (print job)
+                if not winspool.EndDocPrinter(self.hprinter):
+                    logger.warning('EndDocPrinter failed')
             
         except Exception as e:
             logger.error(f'Error writing to printer: {e}')
